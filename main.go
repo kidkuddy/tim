@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -26,14 +27,17 @@ const usage = `tim: take it easy, man. A build queue for shared machines.
 
   tim run [--pool P] [--priority] -- <cmd...>     wait for a slot, run <cmd>, exit with its code
   tim submit [--pool P] [--priority] -- <cmd...>  same, in the background; prints the job id
-  tim status [--json]                what is running and waiting
+  tim status [--json] [--all]        what is running and waiting
+  tim stats                          measured peak memory per pool and command
   tim wait <id>                      block until the job ends, exit with its code
   tim logs [-f] <id>                 output of a submitted job
   tim cancel <id>                    drop a waiting job or stop a running one
   tim config                         config file path and effective values
   tim daemon [stop]                  run or stop the daemon (run starts it by itself)
 
-The pool is picked from the command name (cargo, go, else default).
+The pool is picked from the command: cargo, go, node (tsc, vitest, jest,
+playwright, next/vite build, and pnpm/npm/yarn typecheck|build|test|lint),
+else default.
 --priority starts the job at once, past every slot, memory and CPU limit. It is
 for a human who asks for it; an agent must not add it on its own.
 State lives in ~/.tim (override with TIM_HOME).
@@ -62,6 +66,8 @@ func main() {
 			die(e.Error())
 		}
 		os.Exit(r.Code & 0xff)
+	case "stats":
+		err = cmdStats()
 	case "logs":
 		err = cmdLogs(args)
 	case "cancel":
@@ -184,7 +190,7 @@ func parseRun(name string, args []string) (id, pool string, detached, priority b
 		die(err.Error())
 	}
 	if pool == "" {
-		pool = cfg.poolFor(cmd[0])
+		pool = cfg.poolFor(cmd)
 	} else if _, ok := cfg.Pools[pool]; !ok {
 		die("unknown pool " + pool)
 	}
@@ -239,6 +245,12 @@ wait:
 		}
 	}
 	defer conn.Close()
+	var sendMu sync.Mutex
+	send := func(m Msg) {
+		sendMu.Lock()
+		json.NewEncoder(conn).Encode(m)
+		sendMu.Unlock()
+	}
 	if said {
 		fmt.Fprintf(os.Stderr, "tim: job %s got a slot, starting\n", id)
 	}
@@ -287,10 +299,17 @@ wait:
 		}()
 		exited := make(chan error, 1)
 		go func() { exited <- cmd.Wait() }()
+		// Report the process tree's memory: the daemon schedules on it and
+		// records the peak.
+		sample := time.NewTicker(2 * time.Second)
+		defer sample.Stop()
+		send(Msg{Op: "rss", RSS: treeRSSMB(cmd.Process.Pid)})
 		wasCancelled := false
 	loop:
 		for {
 			select {
+			case <-sample.C:
+				send(Msg{Op: "rss", RSS: treeRSSMB(cmd.Process.Pid)})
 			case s := <-sigs:
 				// In the foreground the terminal already sent Ctrl-C to the child.
 				if s != syscall.SIGINT || detached {
@@ -317,7 +336,7 @@ wait:
 			code = 130
 		}
 	}
-	json.NewEncoder(conn).Encode(Msg{Op: "done", Code: code})
+	send(Msg{Op: "done", Code: code})
 	return code
 }
 
@@ -384,9 +403,12 @@ func cmdStatus(args []string) error {
 			waiting[j.Pool]++
 		}
 	}
-	fmt.Printf("memory: %d MB available of %d, budget %d MB, reserved %d MB\n\n", r.AvailMB, r.TotalMB, r.Config.MemBudgetMB, reserved)
+	fmt.Printf("memory: %d MB available of %d MB\n", r.AvailMB, r.TotalMB)
+	fmt.Printf("budget: %d MB for queued jobs (%d MB kept in reserve for everything else), %d MB claimed by running jobs\n\n",
+		r.Config.MemBudgetMB, r.TotalMB-r.Config.MemBudgetMB, reserved)
+	peaks := peaksByPool(readHistory())
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "POOL\tRUNNING\tWAITING\tMB/JOB")
+	fmt.Fprintln(w, "POOL\tRUNNING\tWAITING\tMB/JOB\tMEASURED P95\tRUNS")
 	names := make([]string, 0, len(r.Config.Pools))
 	for n := range r.Config.Pools {
 		names = append(names, n)
@@ -394,12 +416,16 @@ func cmdStatus(args []string) error {
 	sort.Strings(names)
 	for _, n := range names {
 		p := r.Config.Pools[n]
-		fmt.Fprintf(w, "%s\t%d/%d\t%d\t%d\n", n, running[n], p.Slots, waiting[n], p.MemMB)
+		measured := "-"
+		if len(peaks[n]) > 0 {
+			measured = fmt.Sprintf("%d MB", p95(peaks[n]))
+		}
+		fmt.Fprintf(w, "%s\t%d/%d\t%d\t%d\t%s\t%d\n", n, running[n], p.Slots, waiting[n], p.MemMB, measured, len(peaks[n]))
 	}
 	w.Flush()
 	fmt.Println()
 	userHome, _ := os.UserHomeDir()
-	fmt.Fprintln(w, "ID\tPOOL\tSTATE\tAGE\tCWD\tCMD")
+	fmt.Fprintln(w, "ID\tPOOL\tSTATE\tAGE\tRSS\tCWD\tCMD")
 	shown := 0
 	for _, j := range r.Jobs {
 		state, since := j.State, j.Submitted
@@ -424,7 +450,13 @@ func cmdStatus(args []string) error {
 			cwd = "~" + cwd[len(userHome):]
 		}
 		age := time.Since(time.Unix(since, 0)).Round(time.Second)
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s%s\n", j.ID, j.Pool, state, age, cwd, strings.Join(j.Cmd, " "), note)
+		rss := "-"
+		if j.State == "running" {
+			rss = fmt.Sprintf("%d MB", j.RSSMB)
+		} else if j.PeakMB > 0 {
+			rss = fmt.Sprintf("peak %d MB", j.PeakMB)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s%s\n", j.ID, j.Pool, state, age, rss, cwd, strings.Join(j.Cmd, " "), note)
 		shown++
 	}
 	if shown == 0 {

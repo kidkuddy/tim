@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func ids(js []*Job) string {
 	s := ""
@@ -46,9 +49,72 @@ func TestAdmit(t *testing.T) {
 		}
 	}
 
+	// A cargo build that has not grown yet still owes its memory: with 9000 MB
+	// available and 6800 MB owed, only one 2000 MB node job fits.
+	cfg.MemBudgetMB = 11000
+	young := []*Job{{ID: "c", Pool: "cargo", State: "running", RSSMB: 200}, j("a", "node", "waiting"), j("b", "node", "waiting")}
+	if got := ids(admit(cfg, young, 9000)); got != "a" {
+		t.Errorf("young cargo build: started %q, want a", got)
+	}
+	// Once it has grown, the OS figure already includes it.
+	grown := []*Job{{ID: "c", Pool: "cargo", State: "running", RSSMB: 6800}, j("a", "node", "waiting"), j("b", "node", "waiting")}
+	if got := ids(admit(cfg, grown, 9000)); got != "ab" {
+		t.Errorf("grown cargo build: started %q, want ab", got)
+	}
+
 	// A job bigger than the whole budget still runs when nothing else does.
 	cfg.MemBudgetMB = 5000
 	if got := ids(admit(cfg, []*Job{j("a", "cargo", "waiting")}, 14000)); got != "a" {
 		t.Errorf("oversized job alone: started %q, want a", got)
+	}
+}
+
+func TestPoolFor(t *testing.T) {
+	cfg := defaultConfig()
+	for cmd, want := range map[string]string{
+		"cargo check":                 "cargo",
+		"/usr/bin/cargo test":         "cargo",
+		"go test ./...":               "go",
+		"tsc --noEmit":                "node",
+		"pnpm tsc --noEmit":           "node",
+		"pnpm test":                   "node",
+		"pnpm run typecheck":          "node",
+		"pnpm --filter web run build": "node",
+		"pnpm -F web test:unit":       "node",
+		"npm run lint":                "node",
+		"yarn build":                  "node",
+		"npx playwright test":         "node",
+		"pnpm exec vitest run":        "node",
+		"next build":                  "node",
+		"pnpm vite build":             "node",
+		"node_modules/.bin/jest --ci": "node",
+		"pnpm install":                "default",
+		"pnpm":                        "default",
+		"pnpm dev":                    "default",
+		"next dev":                    "default",
+		"test -f x":                   "default",
+		"build":                       "default",
+		"prettier --write .":          "default",
+		"pnpm exec eslint --fix .":    "default",
+		"make lint":                   "default",
+	} {
+		if got := cfg.poolFor(strings.Fields(cmd)); got != want {
+			t.Errorf("%q -> %s, want %s", cmd, got, want)
+		}
+	}
+}
+
+func TestStats(t *testing.T) {
+	// tree of 1: 1 -> 2 -> 4, 1 -> 3; 9 is unrelated
+	ps := "1 0 1000\n 2 1 2000\n 3 1 500\n 4 2 4000\n 9 0 99999\n"
+	if got := sumTree(ps, 1); got != 7500 {
+		t.Errorf("sumTree = %d, want 7500", got)
+	}
+	v := make([]int, 100)
+	for i := range v {
+		v[i] = i + 1
+	}
+	if p95(v) != 95 || p95([]int{7}) != 7 || p95(nil) != 0 || p95([]int{1, 2, 3}) != 3 {
+		t.Errorf("p95 wrong: %d %d %d %d", p95(v), p95([]int{7}), p95(nil), p95([]int{1, 2, 3}))
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -15,57 +17,122 @@ import (
 // Pool is one queue: how many jobs may run at once and how much memory one
 // job is expected to need at its peak.
 type Pool struct {
-	Slots int      `json:"slots"`
-	MemMB int      `json:"mem_mb"`
-	Match []string `json:"match,omitempty"` // command basenames routed here
+	Slots int `json:"slots"`
+	MemMB int `json:"mem_mb"`
+	// Match routes a command here by its name ("tsc") or its name and first
+	// argument ("next build"). Scripts does the same for package-manager
+	// scripts only (`pnpm test`, `npm run build`), so `/bin/test` is not caught.
+	Match   []string `json:"match,omitempty"`
+	Scripts []string `json:"scripts,omitempty"`
 	// CPU knobs, applied by `tim run` to the command it starts.
 	Nice int               `json:"nice,omitempty"` // niceness added to the command (0-19)
 	Env  map[string]string `json:"env,omitempty"`  // e.g. CARGO_BUILD_JOBS=2; wins over the caller's env
 }
 
 type Config struct {
-	MemBudgetMB int             `json:"mem_budget_mb"` // 0 = 75% of RAM
+	// ReserveMB is memory left for everything tim does not queue (agents,
+	// editors, services). Budget = RAM - reserve unless MemBudgetMB is set.
+	ReserveMB   int             `json:"reserve_mb"`
+	MemBudgetMB int             `json:"mem_budget_mb"`
 	Pools       map[string]Pool `json:"pools"`
 }
 
 func defaultConfig() Config {
-	return Config{Pools: map[string]Pool{
-		"cargo":   {Slots: 1, MemMB: 7000, Match: []string{"cargo"}},
-		"go":      {Slots: 2, MemMB: 2000, Match: []string{"go"}},
+	return Config{ReserveMB: 2500, Pools: map[string]Pool{
+		"cargo": {Slots: 1, MemMB: 7000, Match: []string{"cargo"}},
+		"go":    {Slots: 2, MemMB: 2000, Match: []string{"go"}},
+		"node": {Slots: 2, MemMB: 2000,
+			Match:   []string{"tsc", "vitest", "jest", "playwright", "next build", "vite build"},
+			Scripts: []string{"typecheck", "type-check", "build", "test", "lint"}},
 		"default": {Slots: 4, MemMB: 1000},
 	}}
 }
 
-// loadConfig merges ~/.tim/config.json over the defaults. Pools named in the
-// file replace the default of the same name; others stay.
+// loadConfig merges ~/.tim/config.json over the defaults, field by field: a
+// pool in the file overrides only the fields it sets.
 func loadConfig() (Config, error) {
 	cfg := defaultConfig()
 	b, err := os.ReadFile(filepath.Join(home(), "config.json"))
 	if err == nil {
-		var f Config
+		var f struct {
+			ReserveMB   int                        `json:"reserve_mb"`
+			MemBudgetMB int                        `json:"mem_budget_mb"`
+			Pools       map[string]json.RawMessage `json:"pools"`
+		}
 		if err := json.Unmarshal(b, &f); err != nil {
-			return cfg, fmt.Errorf("config.json: %w", err)
+			return defaultConfig().withBudget(), fmt.Errorf("config.json: %w", err)
 		}
-		if f.MemBudgetMB > 0 {
-			cfg.MemBudgetMB = f.MemBudgetMB
+		if f.ReserveMB > 0 {
+			cfg.ReserveMB = f.ReserveMB
 		}
-		for name, p := range f.Pools {
+		cfg.MemBudgetMB = f.MemBudgetMB
+		for name, raw := range f.Pools {
+			p := cfg.Pools[name]
+			if err := json.Unmarshal(raw, &p); err != nil {
+				return defaultConfig().withBudget(), fmt.Errorf("config.json: pool %s: %w", name, err)
+			}
 			cfg.Pools[name] = p
 		}
 	}
-	if cfg.MemBudgetMB == 0 {
-		total, _ := memMB()
-		cfg.MemBudgetMB = total * 3 / 4
-	}
-	return cfg, nil
+	return cfg.withBudget(), nil
 }
 
-func (c Config) poolFor(cmd string) string {
-	base := filepath.Base(cmd)
-	for name, p := range c.Pools {
-		for _, m := range p.Match {
-			if m == base {
-				return name
+func (c Config) withBudget() Config {
+	if c.MemBudgetMB == 0 {
+		total, _ := memMB()
+		c.MemBudgetMB = total - c.ReserveMB
+	}
+	return c
+}
+
+var pkgManagers = map[string]bool{"pnpm": true, "npm": true, "yarn": true, "npx": true, "bun": true, "bunx": true}
+
+// Package-manager flags that take a value as the next argument.
+var pmValueFlags = map[string]bool{"--filter": true, "-F": true, "-C": true, "--dir": true, "--prefix": true, "--cwd": true}
+
+// unwrap strips a package manager, its flags and run/exec, leaving what it
+// starts: `pnpm --filter web run build` -> [build], viaPM.
+func unwrap(argv []string) (rest []string, viaPM bool) {
+	if !pkgManagers[filepath.Base(argv[0])] {
+		return argv, false
+	}
+	for i := 1; i < len(argv); i++ {
+		switch a := argv[i]; {
+		case pmValueFlags[a]:
+			i++
+		case strings.HasPrefix(a, "-"), a == "run", a == "run-script", a == "exec", a == "dlx", a == "x":
+		default:
+			return argv[i:], true
+		}
+	}
+	return nil, true
+}
+
+func (c Config) poolFor(argv []string) string {
+	rest, viaPM := unwrap(argv)
+	if len(rest) == 0 {
+		return "default"
+	}
+	name := filepath.Base(rest[0])
+	two := name
+	if len(rest) > 1 {
+		two = name + " " + rest[1]
+	}
+	script, _, _ := strings.Cut(name, ":") // test:unit counts as test
+	names := make([]string, 0, len(c.Pools))
+	for n := range c.Pools {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		for _, m := range c.Pools[n].Match {
+			if m == name || m == two {
+				return n
+			}
+		}
+		for _, s := range c.Pools[n].Scripts {
+			if viaPM && (s == name || s == script) {
+				return n
 			}
 		}
 	}
@@ -86,6 +153,8 @@ type Job struct {
 	Ended     int64    `json:"ended,omitempty"`
 	Code      int      `json:"code"`
 	Priority  bool     `json:"priority,omitempty"`
+	RSSMB     int      `json:"rss_mb,omitempty"`  // process tree right now
+	PeakMB    int      `json:"peak_mb,omitempty"` // highest seen
 
 	conn     net.Conn
 	finished chan struct{}
@@ -93,7 +162,7 @@ type Job struct {
 
 // Msg is every request, reply and event on the socket (one JSON per line).
 type Msg struct {
-	Op      string   `json:"op,omitempty"`    // acquire | done | status | cancel | wait | stop
+	Op      string   `json:"op,omitempty"`    // acquire | rss | done | status | cancel | wait | stop
 	Event   string   `json:"event,omitempty"` // queued | go | cancel
 	ID      string   `json:"id,omitempty"`
 	Pool    string   `json:"pool,omitempty"`
@@ -105,6 +174,7 @@ type Msg struct {
 	Pos     int      `json:"pos,omitempty"`
 	Reason  string   `json:"reason,omitempty"`
 	Prio    bool     `json:"priority,omitempty"`
+	RSS     int      `json:"rss_mb,omitempty"`
 	Err     string   `json:"err,omitempty"`
 	Jobs    []*Job   `json:"jobs,omitempty"`
 	AvailMB int      `json:"avail_mb,omitempty"`
@@ -115,7 +185,10 @@ type Msg struct {
 // admit returns the waiting jobs that may start now, in submit order, and
 // sets Reason on the ones that may not. A job starts when its pool has a free
 // slot, the expected memory of all running jobs plus its own fits the budget,
-// and that much memory is available right now. FIFO inside a pool: a blocked
+// and that much memory is available right now. "Available" is what the OS
+// reports minus what running jobs are still expected to grow by (their mem_mb
+// less their measured RSS): a build that started seconds ago has not taken
+// its memory yet. FIFO inside a pool: a blocked
 // job blocks the ones behind it in the same pool, not other pools.
 // A priority job skips all three checks and starts at once; while it runs it
 // still counts against its pool and the budget, so ordinary jobs wait for it.
@@ -123,13 +196,15 @@ type Msg struct {
 // away from a big one. Add aging if a pool starves in practice.
 func admit(cfg Config, jobs []*Job, availMB int) []*Job {
 	running := map[string]int{}
-	reserved := 0
+	reserved, owed := 0, 0
 	for _, j := range jobs {
 		if j.State == "running" {
 			running[j.Pool]++
 			reserved += cfg.Pools[j.Pool].MemMB
+			owed += max(0, cfg.Pools[j.Pool].MemMB-j.RSSMB)
 		}
 	}
+	availMB -= owed
 	var start []*Job
 	blocked := map[string]bool{}
 	for _, j := range jobs {
@@ -153,7 +228,7 @@ func admit(cfg Config, jobs []*Job, availMB int) []*Job {
 		case reserved > 0 && reserved+p.MemMB > cfg.MemBudgetMB:
 			j.Reason = fmt.Sprintf("memory budget: %d MB reserved + %d MB > %d MB", reserved, p.MemMB, cfg.MemBudgetMB)
 		case availMB < p.MemMB:
-			j.Reason = fmt.Sprintf("low memory: %d MB available, needs %d MB", availMB, p.MemMB)
+			j.Reason = fmt.Sprintf("low memory: %d MB free after running jobs reach their size, needs %d MB", availMB, p.MemMB)
 		default:
 			j.Reason = ""
 			running[j.Pool]++
@@ -254,12 +329,26 @@ func (d *daemon) handle(c net.Conn) {
 
 		// The connection is the job's lease: "done" or a drop both end it.
 		code := -1
-		var fin Msg
-		if dec.Decode(&fin) == nil && fin.Op == "done" {
-			code = fin.Code
+		for {
+			var in Msg
+			if dec.Decode(&in) != nil {
+				break
+			}
+			if in.Op == "done" {
+				code = in.Code
+				break
+			}
+			if in.Op == "rss" {
+				d.mu.Lock()
+				j.RSSMB, j.PeakMB = in.RSS, max(j.PeakMB, in.RSS)
+				d.mu.Unlock()
+			}
 		}
 		d.mu.Lock()
-		j.State, j.Code, j.Ended, j.Reason = "done", code, time.Now().Unix(), ""
+		j.State, j.Code, j.Ended, j.Reason, j.RSSMB = "done", code, time.Now().Unix(), "", 0
+		if j.Started > 0 {
+			record(j)
+		}
 		close(j.finished)
 		log.Printf("done %s code=%d", j.ID, code)
 		d.trim()
@@ -340,4 +429,18 @@ func runDaemon() error {
 		}
 		go d.handle(c)
 	}
+}
+
+// record appends a finished job to history.jsonl, the data `tim stats` and
+// the P95 column of `tim status` are computed from.
+// ponytail: the file only grows (~150 bytes a job); rotate if it gets large.
+func record(j *Job) {
+	f, err := os.OpenFile(filepath.Join(home(), "history.jsonl"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	defer f.Close()
+	json.NewEncoder(f).Encode(Record{ID: j.ID, Pool: j.Pool, Cmd: j.Cmd, Cwd: j.Cwd,
+		PeakMB: j.PeakMB, Secs: j.Ended - j.Started, Code: j.Code, Ended: j.Ended})
 }
