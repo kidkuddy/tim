@@ -39,3 +39,6 @@ func memMB() (total, avail int) {
 	}
 	return total, int(pages * pageSize >> 20)
 }
+
+// memPressure: macOS has no PSI; -1 turns the gate off.
+func memPressure() float64 { return -1 }

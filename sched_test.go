@@ -118,3 +118,27 @@ func TestStats(t *testing.T) {
 		t.Errorf("p95 wrong: %d %d %d %d", p95(v), p95([]int{7}), p95(nil), p95([]int{1, 2, 3}))
 	}
 }
+
+func TestAdmitNowPressure(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.MemBudgetMB = 11000
+	j := func(id string, prio bool) *Job { return &Job{ID: id, Pool: "go", State: "waiting", Priority: prio} }
+
+	if got := ids(admitNow(cfg, []*Job{j("a", false)}, 14000, 5)); got != "a" {
+		t.Fatalf("low pressure: got %q, want a", got)
+	}
+	if got := ids(admitNow(cfg, []*Job{j("a", false)}, 14000, -1)); got != "a" {
+		t.Fatalf("no PSI (macOS): got %q, want a", got)
+	}
+	held := []*Job{j("a", false), {ID: "p", Pool: "cargo", State: "waiting", Priority: true}}
+	if got := ids(admitNow(cfg, held, 14000, 60)); got != "p" {
+		t.Fatalf("under pressure only priority starts: got %q, want p", got)
+	}
+	if !strings.HasPrefix(held[0].Reason, "memory pressure 60%") {
+		t.Fatalf("reason = %q", held[0].Reason)
+	}
+	cfg.MaxMemPressure = 0
+	if got := ids(admitNow(cfg, []*Job{j("a", false)}, 14000, 90)); got != "a" {
+		t.Fatalf("gate off: got %q, want a", got)
+	}
+}

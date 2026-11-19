@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -109,8 +110,18 @@ func die(msg string) {
 func home() string {
 	h := os.Getenv("TIM_HOME")
 	if h == "" {
-		u, _ := os.UserHomeDir()
-		h = filepath.Join(u, ".tim")
+		// The account's home from the user database, not $HOME: a build that
+		// sets HOME for a test (Playwright's pwtest/home) would otherwise start
+		// its own daemon with its own queue and skip every limit.
+		u, err := user.Current()
+		dir := ""
+		if err == nil {
+			dir = u.HomeDir
+		}
+		if dir == "" {
+			dir, _ = os.UserHomeDir()
+		}
+		h = filepath.Join(dir, ".tim")
 	}
 	os.MkdirAll(filepath.Join(h, "jobs"), 0o700)
 	return h

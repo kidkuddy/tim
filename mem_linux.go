@@ -30,3 +30,25 @@ func memMB() (total, avail int) {
 	}
 	return
 }
+
+// memPressure returns PSI "some avg10" for memory (0-100), or -1 if unavailable.
+func memPressure() float64 {
+	b, err := os.ReadFile("/proc/pressure/memory")
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "some ") {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(f, "avg10="); ok {
+				p, err := strconv.ParseFloat(v, 64)
+				if err == nil {
+					return p
+				}
+			}
+		}
+	}
+	return -1
+}
