@@ -32,13 +32,18 @@ type Pool struct {
 type Config struct {
 	// ReserveMB is memory left for everything tim does not queue (agents,
 	// editors, services). Budget = RAM - reserve unless MemBudgetMB is set.
-	ReserveMB   int             `json:"reserve_mb"`
-	MemBudgetMB int             `json:"mem_budget_mb"`
-	Pools       map[string]Pool `json:"pools"`
+	ReserveMB   int `json:"reserve_mb"`
+	MemBudgetMB int `json:"mem_budget_mb"`
+	// MaxMemPressure: while the kernel's memory pressure (Linux PSI "some avg10",
+	// the % of time a task stalled on memory) is at or above it, no new job starts.
+	// MemAvailable counts reclaimable cache and misses a box that is already
+	// swapping; pressure does not. 0 turns the check off.
+	MaxMemPressure float64         `json:"max_mem_pressure"`
+	Pools          map[string]Pool `json:"pools"`
 }
 
 func defaultConfig() Config {
-	return Config{ReserveMB: 2500, Pools: map[string]Pool{
+	return Config{ReserveMB: 2500, MaxMemPressure: 20, Pools: map[string]Pool{
 		"cargo": {Slots: 1, MemMB: 7000, Match: []string{"cargo"}},
 		"go":    {Slots: 2, MemMB: 2000, Match: []string{"go"}},
 		"node": {Slots: 2, MemMB: 2000,
@@ -55,9 +60,10 @@ func loadConfig() (Config, error) {
 	b, err := os.ReadFile(filepath.Join(home(), "config.json"))
 	if err == nil {
 		var f struct {
-			ReserveMB   int                        `json:"reserve_mb"`
-			MemBudgetMB int                        `json:"mem_budget_mb"`
-			Pools       map[string]json.RawMessage `json:"pools"`
+			ReserveMB      int                        `json:"reserve_mb"`
+			MemBudgetMB    int                        `json:"mem_budget_mb"`
+			MaxMemPressure *float64                   `json:"max_mem_pressure"`
+			Pools          map[string]json.RawMessage `json:"pools"`
 		}
 		if err := json.Unmarshal(b, &f); err != nil {
 			return defaultConfig().withBudget(), fmt.Errorf("config.json: %w", err)
@@ -66,6 +72,9 @@ func loadConfig() (Config, error) {
 			cfg.ReserveMB = f.ReserveMB
 		}
 		cfg.MemBudgetMB = f.MemBudgetMB
+		if f.MaxMemPressure != nil {
+			cfg.MaxMemPressure = *f.MaxMemPressure
+		}
 		for name, raw := range f.Pools {
 			p := cfg.Pools[name]
 			if err := json.Unmarshal(raw, &p); err != nil {
@@ -242,6 +251,22 @@ func admit(cfg Config, jobs []*Job, availMB int) []*Job {
 	return start
 }
 
+// admitNow is admit plus the memory-pressure gate: under pressure only
+// priority jobs start, and every other waiting job says why it waits.
+// psi < 0 means the platform does not report pressure (macOS).
+func admitNow(cfg Config, jobs []*Job, availMB int, psi float64) []*Job {
+	if psi < 0 || cfg.MaxMemPressure <= 0 || psi < cfg.MaxMemPressure {
+		return admit(cfg, jobs, availMB)
+	}
+	start := admit(cfg, jobs, -1<<30) // priority jobs skip the memory checks and still start
+	for _, j := range jobs {
+		if j.State == "waiting" && !j.Priority && strings.HasPrefix(j.Reason, "low memory") {
+			j.Reason = fmt.Sprintf("memory pressure %.0f%% (limit %.0f%%)", psi, cfg.MaxMemPressure)
+		}
+	}
+	return start
+}
+
 type daemon struct {
 	mu   sync.Mutex
 	jobs []*Job // waiting, running and the most recent done ones
@@ -254,7 +279,7 @@ func (d *daemon) schedule() {
 		log.Print(err, " (using defaults)")
 	}
 	_, avail := memMB()
-	for _, j := range admit(cfg, d.jobs, avail) {
+	for _, j := range admitNow(cfg, d.jobs, avail, memPressure()) {
 		j.State, j.Started = "running", time.Now().Unix()
 		json.NewEncoder(j.conn).Encode(Msg{Event: "go"})
 		log.Printf("start %s [%s] priority=%v pid=%d cwd=%s %v", j.ID, j.Pool, j.Priority, j.PID, j.Cwd, j.Cmd)
@@ -359,7 +384,7 @@ func (d *daemon) handle(c net.Conn) {
 		cfg, _ := loadConfig()
 		total, avail := memMB()
 		d.mu.Lock()
-		admit(cfg, d.jobs, avail) // refresh the waiting reasons
+		admitNow(cfg, d.jobs, avail, memPressure()) // refresh the waiting reasons
 		enc.Encode(Msg{Jobs: d.jobs, AvailMB: avail, TotalMB: total, Config: &cfg})
 		d.mu.Unlock()
 
